@@ -1,9 +1,14 @@
 {
-  "title": "Foundation Level Extensions",
+  "title": "Overview Foundation Level Extensions",
   "outline": [
     {
       "level": "H1",
       "text": "Overview",
+      "page": 1
+    },
+    {
+      "level": "H1",
+      "text": "Foundation Level Extensions",
       "page": 1
     },
     {
