@@ -300,9 +300,13 @@ class PDFStructureParser:
                     # Position score (higher on page is better)
                     relative_y = y0 / page_height
                     if relative_y < 0.15:
+                        score += 25
+                    elif relative_y < 0.25:
                         score += 20
-                    elif relative_y < 0.3:
-                        score += 12
+                    elif relative_y < 0.35:
+                        score += 15
+                    else:
+                        score += 5
                     
                     # Centering score
                     line_center = (x0 + x1) / 2
@@ -323,13 +327,49 @@ class PDFStructureParser:
                     title_candidates.append({
                         'text': line_text,
                         'score': score,
-                        'size': max_size
+                        'size': max_size,
+                        'position_y': y0,
+                        'relative_y': relative_y
                     })
         
-        # Return the highest scoring candidate
+        # Deduplicate fragmented title candidates
+        title_candidates = self._deduplicate_title_candidates(title_candidates)
+        
+        # Sort candidates by score and position
         if title_candidates:
-            title_candidates.sort(key=lambda x: x['score'], reverse=True)
-            return title_candidates[0]['text']
+            title_candidates.sort(key=lambda x: (-x['score'], x['relative_y']))
+            
+            # Check if we should combine multiple title parts
+            best_candidate = title_candidates[0]
+            combined_title = best_candidate['text']
+            combined_parts = [best_candidate]
+            
+            # Look for additional title parts with same font size and close position
+            # Limit to maximum 3 parts to prevent over-combining
+            for candidate in title_candidates[1:]:
+                if len(combined_parts) >= 3:  # Limit to 3 parts maximum
+                    break
+                    
+                # Check if this candidate could be part of the same title
+                if (candidate['size'] == best_candidate['size'] and  # Same font size
+                    abs(candidate['relative_y'] - best_candidate['relative_y']) < 0.1 and  # Close vertically
+                    candidate['relative_y'] < 0.4 and  # Still in title area
+                    len(candidate['text']) > 2 and  # Not too short
+                    len(candidate['text']) < 50):  # Not too long
+                    
+                    # Check for duplicate text to avoid repetition
+                    if candidate['text'] not in combined_title:
+                        # Add this part to the title
+                        if candidate['relative_y'] < best_candidate['relative_y']:
+                            # This part comes before the current title
+                            combined_title = candidate['text'] + " " + combined_title
+                        else:
+                            # This part comes after the current title
+                            combined_title = combined_title + " " + candidate['text']
+                        
+                        combined_parts.append(candidate)
+            
+            return combined_title
         
         return ""
     
@@ -430,6 +470,249 @@ class PDFStructureParser:
                 unique_headings.append(heading)
         
         return unique_headings
+    
+    def _deduplicate_title_candidates(self, candidates):
+        """Remove duplicate and fragmented title candidates at the same position."""
+        if not candidates:
+            return candidates
+        
+        # Group candidates by position (with small tolerance)
+        position_groups = {}
+        
+        for candidate in candidates:
+            # Create a position key with tolerance
+            pos_key = (
+                round(candidate['relative_y'], 2),  # Y position with tolerance
+                candidate['size']
+            )
+            
+            if pos_key not in position_groups:
+                position_groups[pos_key] = []
+            position_groups[pos_key].append(candidate)
+        
+        deduplicated = []
+        
+        for pos_key, group in position_groups.items():
+            if len(group) == 1:
+                # Single candidate at this position
+                deduplicated.append(group[0])
+            else:
+                # Multiple candidates at same position - need to deduplicate
+                # Sort by text length (longest first) and score
+                group.sort(key=lambda x: (-len(x['text']), -x['score']))
+                
+                # Find the best complete text using general patterns
+                best_text = ""
+                best_candidate = None
+                
+                for candidate in group:
+                    text = candidate['text'].strip()
+                    
+                    # Skip obvious fragments (very short)
+                    if len(text) < 3:
+                        continue
+                    
+                    # Skip fragments that end with incomplete words (general pattern)
+                    if self._is_incomplete_fragment(text):
+                        continue
+                    
+                    # Prefer longer, more complete text
+                    if len(text) > len(best_text):
+                        best_text = text
+                        best_candidate = candidate
+                
+                # If no good candidate found, try to reconstruct from fragments
+                if not best_candidate:
+                    # Try to reconstruct complete text from all fragments
+                    reconstructed_text = self._try_reconstruct_from_fragments(group)
+                    if reconstructed_text and len(reconstructed_text) > len(best_text):
+                        best_text = reconstructed_text
+                        best_candidate = group[0]  # Use first candidate as template
+                
+                # If still no good candidate, use the longest one
+                if not best_candidate and group:
+                    best_candidate = group[0]
+                    best_text = best_candidate['text']
+                
+                # Clean up the text using general cleaning
+                if best_text:
+                    cleaned_text = self._clean_fragmented_text(best_text)
+                    if cleaned_text:  # Only add if cleaning produced valid text
+                        best_candidate['text'] = cleaned_text
+                        deduplicated.append(best_candidate)
+        
+        return deduplicated
+    
+    def _is_incomplete_fragment(self, text):
+        """Check if text appears to be an incomplete fragment using general patterns."""
+        text = text.strip()
+        
+        # Check for single letters or very short fragments
+        if len(text) <= 2:
+            return True
+        
+        # Check for very short fragments (general pattern)
+        # Only check for single letters and very short incomplete patterns
+        if text.endswith((' f', ' r')) or len(text.split()[-1]) <= 2:
+            return True
+        
+        # Check for fragments that start with single letters
+        if len(text.split()[0]) <= 2:
+            return True
+        
+        return False
+    
+    def _has_complete_words(self, text):
+        """Check if text contains complete, meaningful words."""
+        words = text.split()
+        complete_word_count = 0
+        
+        for word in words:
+            # Consider a word complete if it's longer than 2 characters
+            # and doesn't look like a fragment
+            if len(word) > 2 and not self._is_word_fragment(word):
+                complete_word_count += 1
+        
+        # Text is considered to have complete words if at least half are complete
+        return complete_word_count >= len(words) / 2
+    
+    def _is_word_fragment(self, word):
+        """Check if a single word appears to be a fragment."""
+        word_lower = word.lower().strip('.,!?;:')
+        
+        # Very short words are likely fragments
+        if len(word_lower) <= 2:
+            return True
+        
+        # Only check for very short words as fragments
+        return False  # Remove all hardcoded patterns
+    
+    def _clean_fragmented_text(self, text):
+        """Clean up fragmented text using general patterns."""
+        if not text:
+            return ""
+        
+        # Remove obvious repetitions and fragments
+        words = text.split()
+        cleaned_words = []
+        seen_words = set()
+        
+        for word in words:
+            word_clean = word.strip('.,!?;:').lower()
+            
+            # Skip very short fragments
+            if len(word_clean) < 2:
+                continue
+            
+            # Skip obvious incomplete fragments
+            if self._is_word_fragment(word):
+                continue
+            
+            # Avoid adding duplicate words (case-insensitive)
+            if word_clean not in seen_words:
+                cleaned_words.append(word)
+                seen_words.add(word_clean)
+        
+        cleaned_text = ' '.join(cleaned_words)
+        
+        # General text reconstruction patterns (without hardcoding specific words)
+        # Fix common fragmentation patterns
+        cleaned_text = self._reconstruct_common_patterns(cleaned_text)
+        
+        return cleaned_text.strip()
+    
+    def _reconstruct_common_patterns(self, text):
+        """Reconstruct common fragmentation patterns using only general patterns."""
+        import re
+        
+        # Remove standalone single letters that are likely fragments
+        text = re.sub(r'\b[a-zA-Z]\b', '', text)
+        
+        # Clean up multiple spaces
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
+    
+    def _try_reconstruct_from_fragments(self, group):
+        """Try to reconstruct complete text from multiple fragments."""
+        # Sort fragments by length (longest first)
+        fragments = sorted([c['text'].strip() for c in group], key=len, reverse=True)
+        
+        # Try to find the most complete fragment as a base
+        base_text = ""
+        for fragment in fragments:
+            # Skip very short fragments
+            if len(fragment) < 4:
+                continue
+            
+            # Look for fragments that seem more complete
+            if ':' in fragment and len(fragment) > len(base_text):
+                base_text = fragment
+                break
+        
+        # If no good base found, use the longest fragment
+        if not base_text and fragments:
+            base_text = fragments[0]
+        
+        # Try to extend the base text using other fragments
+        if base_text:
+            # Look for fragments that could extend the base text
+            for fragment in fragments:
+                if fragment == base_text:
+                    continue
+                
+                # Check if this fragment could extend our base text
+                extended = self._try_extend_text(base_text, fragment)
+                if extended and len(extended) > len(base_text):
+                    base_text = extended
+        
+        return base_text
+    
+    def _try_extend_text(self, base_text, fragment):
+        """Try to extend base text with a fragment."""
+        base_lower = base_text.lower()
+        fragment_lower = fragment.lower()
+        
+        # Skip if fragment is already contained in base
+        if fragment_lower in base_lower:
+            return base_text
+        
+        # Try to find logical extensions
+        # Pattern 1: base ends with incomplete word, fragment starts with completion
+        base_words = base_text.split()
+        fragment_words = fragment.split()
+        
+        if base_words and fragment_words:
+            last_base_word = base_words[-1].lower()
+            first_fragment_word = fragment_words[0].lower()
+            
+            # Check if fragment could complete the last word
+            if len(last_base_word) < 4 and first_fragment_word.startswith(last_base_word):
+                # Replace the incomplete word with the complete one
+                extended_words = base_words[:-1] + fragment_words
+                return ' '.join(extended_words)
+            
+            # Check if fragment continues the text logically
+            if self._is_logical_continuation(last_base_word, first_fragment_word):
+                return base_text + ' ' + fragment
+        
+        return base_text
+    
+    def _is_logical_continuation(self, last_word, first_word):
+        """Check if first_word is a logical continuation of last_word using only general patterns."""
+        last_clean = last_word.strip('.,!?;:').lower()
+        first_clean = first_word.strip('.,!?;:').lower()
+        
+        # General patterns for logical continuation
+        # 1. Short words (likely incomplete) followed by longer words
+        if len(last_clean) <= 3 and len(first_clean) > 3:
+            return True
+        
+        # 2. Single letters followed by words
+        if len(last_clean) == 1 and len(first_clean) > 2:
+            return True
+        
+        return False
     
     def _is_likely_heading(self, text: str) -> bool:
         """Check if text is likely to be a real heading using intelligent analysis."""
